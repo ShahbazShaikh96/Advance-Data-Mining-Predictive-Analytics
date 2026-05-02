@@ -1,0 +1,99 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r}
+library(ISLR)
+library(dplyr)
+library(glmnet)
+library(caret)
+
+Carseats_Filtered <- Carseats %>% 
+  select(Sales, Price, Advertising, Population, Age, Income, Education)
+
+```
+
+
+```{r}
+library(ISLR)
+library(dplyr)
+library(caret)
+
+set.seed(123)
+
+Carseats_Filtered <- Carseats %>%
+  select(Sales, Price, Advertising, Population, Age, Income, Education)
+
+train_control <- trainControl(method = "cv", number = 5)
+
+svm_linear_model <- train(
+  Sales ~ .,
+  data = Carseats_Filtered,
+  method = "svmLinear",
+  trControl = train_control
+)
+
+svm_linear_model
+
+```
+
+```{r}
+set.seed(123)
+
+train_control_repeated <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 2
+)
+
+svm_grid <- expand.grid(C = c(0.1, 0.5, 1, 10))
+
+svm_tuned_model <- train(
+  Sales ~ .,
+  data = Carseats_Filtered,
+  method = "svmLinear",
+  trControl = train_control_repeated,
+  tuneGrid = svm_grid
+)
+
+svm_tuned_model
+plot(svm_tuned_model)
+
+```
+
+```{r}
+set.seed(123)
+
+nnet_model <- train(
+  Sales ~ .,
+  data = Carseats_Filtered,
+  method = "nnet",
+  preProcess = c("center", "scale"),
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500
+)
+
+nnet_model
+plot(nnet_model)
+
+```
+
+
+
+```{r}
+new_data <- data.frame(
+  Price = 6.54,
+  Advertising = 0,
+  Population = 124,
+  Age = 76,
+  Income = 110,
+  Education = 10
+)
+
+predicted_sales <- predict(nnet_model, newdata = new_data)
+predicted_sales
+
+```
+
