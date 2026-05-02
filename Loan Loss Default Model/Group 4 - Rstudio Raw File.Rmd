@@ -1,0 +1,890 @@
+---
+title: "ADMT"
+author: "Shahbaz Shaikh"
+date: "2026-04-26"
+output: html_document
+---
+
+# Loan Default and Loss Prediction - Two Stage Modeling
+
+## Loading Libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(caret)
+library(xgboost)
+library(randomForest)
+library(pROC)
+library(Metrics)
+library(ggplot2)
+library(knitr)
+library(glmnet)
+library(pls)
+
+set.seed(42)
+options(scipen = 999)
+```
+
+## Loading Data
+
+```{r}
+train_path <- normalizePath("~/Desktop/Group Project ADM&PA/train_v3.csv")
+test_path  <- normalizePath("~/Desktop/Group Project ADM&PA/test__no_lossv3.csv")
+
+train_df <- fread(train_path)
+test_df  <- fread(test_path)
+
+cat("Train shape:", dim(train_df), "\n")
+cat("Test shape:", dim(test_df), "\n")
+
+head(train_df)
+head(test_df)
+```
+
+### Interpretation
+
+The raw CSV files include one extra index-style column in addition to the modeling columns. In this R workflow it appears as `V1`. Since this column is not a real predictor, it should be removed before modeling so that the reported feature counts reflect only the usable input variables.
+
+## Data Understanding and Initial Exploration
+
+In this step, I inspect the dataset structure, missing values, and target distribution. This helps confirm that the project is a zero-inflated loss prediction problem, where most loans have no loss and only a smaller portion have positive loss.
+
+```{r}
+cat("Missing values in train (top 20):\n")
+train_missing <- sort(colSums(is.na(train_df)), decreasing = TRUE)
+head(train_missing, 20)
+
+cat("\nMissing values in test (top 20):\n")
+test_missing <- sort(colSums(is.na(test_df)), decreasing = TRUE)
+head(test_missing, 20)
+
+ggplot(data.frame(loss = train_df$loss), aes(x = loss)) +
+  geom_histogram(bins = 50) +
+  labs(
+    title = "Training Loss Distribution",
+    x = "loss",
+    y = "count"
+  )
+
+default_rate <- mean(train_df$loss > 0) * 100
+cat(sprintf("Default rate: %.2f%%\n", default_rate))
+```
+
+### Interpretation
+
+The target variable is highly imbalanced and zero-inflated. This makes a two-stage modeling approach appropriate. In Stage 1, the model predicts whether a loan will incur any loss. In Stage 2, the model predicts the severity of loss only for loans that actually default.
+
+## Feature and Target Separation
+
+In this step, I separate the identifiers, the continuous target (`loss`), the binary target (`default`), and the feature matrix. The test set keeps the `id` column separately so it can be used later when generating the final submission file.
+
+```{r}
+# Remove extra CSV index column if present
+index_like_cols <- c("Unnamed: 0", "V1", "X")
+train_index_cols <- intersect(names(train_df), index_like_cols)
+test_index_cols  <- intersect(names(test_df), index_like_cols)
+
+if (length(train_index_cols) > 0) {
+  train_df <- train_df %>% select(-all_of(train_index_cols))
+}
+
+if (length(test_index_cols) > 0) {
+  test_df <- test_df %>% select(-all_of(test_index_cols))
+}
+
+train_ids <- train_df$id
+test_ids  <- test_df$id
+
+y_loss <- train_df$loss
+y_default <- ifelse(y_loss > 0, 1, 0)
+
+X_train_raw <- train_df %>% select(-id, -loss) %>% as.data.frame()
+X_test_raw  <- test_df %>% select(-id) %>% as.data.frame()
+
+X_test_raw <- X_test_raw[, names(X_train_raw)]
+
+data_overview <- data.frame(
+  Metric = c(
+    "Training Rows",
+    "Test Rows",
+    "Training Columns After Cleanup",
+    "Test Columns After Cleanup",
+    "Number of Raw Predictor Features",
+    "Default Rate",
+    "Zero Loss Rate"
+  ),
+  Value = c(
+    nrow(X_train_raw),
+    nrow(X_test_raw),
+    ncol(train_df),
+    ncol(test_df),
+    ncol(X_train_raw),
+    paste0(round(mean(y_default) * 100, 2), "%"),
+    paste0(round(mean(y_loss == 0) * 100, 2), "%")
+  )
+)
+
+kable(data_overview, caption = "Dataset Overview")
+```
+
+### Interpretation
+
+After removing the extra index column and separating out `id` and `loss`, the modeling dataset contains `r ncol(X_train_raw)` predictor features in both train and test. This is the actual set of usable modeling inputs for the rest of the analysis.
+
+## Train-Validation Split
+
+The raw training data is split into training and validation subsets using an 80/20 ratio. Stratification is based on the binary default variable so that the class imbalance is preserved in both sets.
+
+```{r}
+split_index <- createDataPartition(y_default, p = 0.8, list = FALSE)
+
+X_train_split_raw <- X_train_raw[split_index, , drop = FALSE]
+X_val_split_raw   <- X_train_raw[-split_index, , drop = FALSE]
+
+y_loss_train <- y_loss[split_index]
+y_loss_val   <- y_loss[-split_index]
+
+y_default_train <- y_default[split_index]
+y_default_val   <- y_default[-split_index]
+```
+
+## Encoding Non-Numeric Features
+
+Non-numeric columns must be converted into numeric form before modeling. For this dataset, an integer-mapping approach is computationally lighter than full one-hot encoding, especially with many variables. The mapping is fit on the training split only and then applied to validation and test data. Unseen categories are assigned `0`, which prevents leakage and keeps the pipeline manageable.
+
+```{r}
+fit_level_maps <- function(df) {
+  level_maps <- list()
+  for (col in names(df)) {
+    if (!is.numeric(df[[col]])) {
+      level_maps[[col]] <- unique(as.character(df[[col]]))
+    }
+  }
+  level_maps
+}
+
+apply_level_maps <- function(df, level_maps) {
+  df_out <- df
+  for (col in names(df_out)) {
+    if (col %in% names(level_maps)) {
+      mapped <- match(as.character(df_out[[col]]), level_maps[[col]])
+      mapped[is.na(mapped)] <- 0L
+      df_out[[col]] <- mapped
+    }
+  }
+  df_out[] <- lapply(df_out, function(x) {
+    if (is.logical(x)) as.integer(x) else x
+  })
+  as.data.frame(df_out)
+}
+
+split_level_maps <- fit_level_maps(X_train_split_raw)
+
+X_train_encoded <- apply_level_maps(X_train_split_raw, split_level_maps)
+X_val_encoded   <- apply_level_maps(X_val_split_raw, split_level_maps)
+X_test_encoded  <- apply_level_maps(X_test_raw, split_level_maps)
+
+safe_feature_names <- make.names(names(X_train_encoded), unique = TRUE)
+names(X_train_encoded) <- safe_feature_names
+names(X_val_encoded)   <- safe_feature_names
+names(X_test_encoded)  <- safe_feature_names
+
+cat("Encoded train shape:", dim(X_train_encoded), "\n")
+cat("Encoded validation shape:", dim(X_val_encoded), "\n")
+cat("Encoded test shape:", dim(X_test_encoded), "\n")
+```
+
+### Interpretation
+
+This encoding approach keeps the preprocessing lightweight while ensuring that the mapping is learned from training data only instead of from combined train and test data.
+
+## Handling Missing Values
+
+Median imputation is used because it is robust to outliers and works well for financial data. The imputer is fit only on the training split and then applied to validation and test data.
+
+```{r}
+imputer <- preProcess(X_train_encoded, method = "medianImpute")
+
+X_train_imputed <- predict(imputer, X_train_encoded)
+X_val_imputed   <- predict(imputer, X_val_encoded)
+X_test_imputed  <- predict(imputer, X_test_encoded)
+```
+
+## Feature Scaling
+
+Standardization is applied to make the numeric features comparable in scale. This is especially important for linear and regularized models such as Logistic Regression, Elastic Net, Ridge, and PLS.
+
+```{r}
+scaler <- preProcess(X_train_imputed, method = c("center", "scale"))
+
+X_train_scaled <- predict(scaler, X_train_imputed)
+X_val_scaled   <- predict(scaler, X_val_imputed)
+X_test_scaled  <- predict(scaler, X_test_imputed)
+
+clean_numeric_df <- function(df) {
+  df[] <- lapply(df, function(x) {
+    x <- as.numeric(x)
+    x[!is.finite(x)] <- 0
+    x
+  })
+  as.data.frame(df)
+}
+
+X_train_scaled <- clean_numeric_df(X_train_scaled)
+X_val_scaled   <- clean_numeric_df(X_val_scaled)
+X_test_scaled  <- clean_numeric_df(X_test_scaled)
+```
+
+## Feature Reduction using PCA and PLS
+
+This section explores whether dimensionality reduction can simplify the feature space while still preserving predictive information. PCA and PLS are compared to see how well reduced representations support loss prediction on the validation set.
+
+### Why this section matters
+
+This part is exploratory rather than final-model selection. The goal is to check whether reducing the feature space helps simplify the problem without losing too much predictive information. PCA summarizes variance in the predictors, while PLS tries to find components that are more directly related to the target.
+
+### Step 1: Prepare PCA inputs and select the number of components
+
+In this chunk, I remove constant columns, fit PCA on the training data only, and keep enough components to explain 95% of the variance.
+
+```{r}
+# PCA retaining 95% of variance
+non_constant_cols <- apply(X_train_scaled, 2, function(x) is.finite(sd(x)) && sd(x) > 0)
+
+X_train_pca_input <- X_train_scaled[, non_constant_cols, drop = FALSE]
+X_val_pca_input   <- X_val_scaled[, non_constant_cols, drop = FALSE]
+
+pca_full <- prcomp(X_train_pca_input, center = FALSE, scale. = FALSE)
+variance_ratio <- (pca_full$sdev ^ 2) / sum(pca_full$sdev ^ 2)
+variance_ratio[!is.finite(variance_ratio)] <- 0
+cumulative_variance <- cumsum(variance_ratio)
+
+pca_components <- which(cumulative_variance >= 0.95)[1]
+if (is.na(pca_components) || length(pca_components) == 0) {
+  pca_components <- ncol(X_train_pca_input)
+}
+
+X_train_pca <- predict(pca_full, X_train_pca_input)[, 1:pca_components, drop = FALSE]
+X_val_pca   <- predict(pca_full, X_val_pca_input)[, 1:pca_components, drop = FALSE]
+
+cat("Optimal PCA Components (95% variance):", pca_components, "\n")
+
+# PLS comparison using a small search over component counts
+pls_range <- c(5, 10, 15, 20, 25)
+pls_range <- pls_range[pls_range < nrow(X_train_scaled)]
+pls_range <- pls_range[pls_range <= ncol(X_train_scaled)]
+
+best_pls_components <- NA
+best_pls_mae <- Inf
+
+for (n_comp in pls_range) {
+  pls_fit_tmp <- plsr(
+    y_loss_train ~ .,
+    data = data.frame(y_loss_train = y_loss_train, X_train_scaled),
+    ncomp = n_comp,
+    method = "oscorespls",
+    validation = "none"
+  )
+
+  pred_tmp <- as.vector(
+    predict(pls_fit_tmp, newdata = data.frame(X_val_scaled), ncomp = n_comp)
+  )
+  pred_tmp[!is.finite(pred_tmp)] <- 0
+  mae_tmp <- mae(y_loss_val, pred_tmp)
+  if (!is.finite(mae_tmp)) {
+    mae_tmp <- Inf
+  }
+
+  cat("PLS Components:", n_comp, "MAE:", round(mae_tmp, 6), "\n")
+
+  if (mae_tmp < best_pls_mae) {
+    best_pls_mae <- mae_tmp
+    best_pls_components <- n_comp
+  }
+}
+
+cat("\nBest PLS Components:", best_pls_components, "\n")
+cat("Best PLS MAE:", round(best_pls_mae, 6), "\n")
+```
+
+### Step 2: Compare PCA and PLS using validation MAE
+
+After identifying the PCA and PLS representations, I compare them using a common validation metric. Lower MAE means the transformed feature space is more useful for predicting loss values.
+
+```{r}
+# PCA-based linear regression
+pca_train_df <- data.frame(y_loss_train = y_loss_train, X_train_pca)
+pca_val_df   <- data.frame(X_val_pca)
+
+model_pca <- lm(y_loss_train ~ ., data = pca_train_df)
+pred_pca <- predict(model_pca, newdata = pca_val_df)
+pred_pca[!is.finite(pred_pca)] <- 0
+mae_pca <- mae(y_loss_val, pred_pca)
+
+# Final PLS model based on selected component count
+pls_fit <- plsr(
+  y_loss_train ~ .,
+  data = data.frame(y_loss_train = y_loss_train, X_train_scaled),
+  ncomp = best_pls_components,
+  method = "oscorespls",
+  validation = "none"
+)
+
+pred_pls <- as.vector(
+  predict(pls_fit, newdata = data.frame(X_val_scaled), ncomp = best_pls_components)
+)
+pred_pls[!is.finite(pred_pls)] <- 0
+mae_pls <- mae(y_loss_val, pred_pls)
+
+dim_reduction_results <- data.frame(
+  Method = c("PCA", "PLS"),
+  MAE = c(mae_pca, mae_pls)
+)
+
+kable(dim_reduction_results, caption = "PCA vs PLS Comparison (MAE)")
+```
+
+## Stage 1: Default Classification Models
+
+The first stage predicts the probability that a loan incurs any loss.
+
+### Why Stage 1 comes first
+
+Because most loans have zero loss, it is more natural to first predict whether a loan defaults at all. This turns the first stage into a classification problem, and the output probability can later be combined with predicted severity from Stage 2.
+
+### Logistic Regression Baseline
+
+This baseline gives a simple, regularized model that is easy to interpret and useful for comparison against more flexible methods.
+
+```{r}
+logistic_model <- cv.glmnet(
+  x = as.matrix(X_train_scaled),
+  y = y_default_train,
+  family = "binomial",
+  alpha = 0,
+  type.measure = "auc",
+  nfolds = 5
+)
+
+logistic_val_proba <- as.vector(
+  predict(logistic_model, newx = as.matrix(X_val_scaled), s = "lambda.min", type = "response")
+)
+logistic_auc <- as.numeric(roc(y_default_val, logistic_val_proba, quiet = TRUE)$auc)
+
+cat("Logistic Regression Validation AUC:", round(logistic_auc, 6), "\n")
+```
+
+### Elastic Net Logistic Regression
+
+Elastic Net extends the baseline by blending ridge and lasso style regularization. This can help when the dataset is high-dimensional and features may be correlated.
+
+```{r}
+x_train_mat <- as.matrix(X_train_scaled)
+x_val_mat   <- as.matrix(X_val_scaled)
+
+alpha_grid <- c(0.1, 0.5, 0.9)
+lambda_grid <- 10 ^ seq(-3, 1, length.out = 20)
+
+best_enet_auc <- -Inf
+best_alpha <- NA
+best_lambda <- NA
+best_enet_model <- NULL
+
+for (alpha_value in alpha_grid) {
+  cv_fit <- cv.glmnet(
+    x = x_train_mat,
+    y = y_default_train,
+    family = "binomial",
+    alpha = alpha_value,
+    lambda = lambda_grid,
+    type.measure = "auc",
+    nfolds = 5
+  )
+
+  val_proba_tmp <- as.vector(predict(cv_fit, newx = x_val_mat, s = "lambda.min", type = "response"))
+  auc_tmp <- as.numeric(roc(y_default_val, val_proba_tmp, quiet = TRUE)$auc)
+
+  if (auc_tmp > best_enet_auc) {
+    best_enet_auc <- auc_tmp
+    best_alpha <- alpha_value
+    best_lambda <- cv_fit$lambda.min
+    best_enet_model <- cv_fit
+  }
+}
+
+elastic_net_val_proba <- as.vector(predict(best_enet_model, newx = x_val_mat, s = "lambda.min", type = "response"))
+elastic_net_auc <- as.numeric(roc(y_default_val, elastic_net_val_proba, quiet = TRUE)$auc)
+
+cat("Best Elastic Net alpha:", best_alpha, "\n")
+cat("Best Elastic Net lambda:", best_lambda, "\n")
+cat("Elastic Net Validation AUC:", round(elastic_net_auc, 6), "\n")
+```
+
+### XGBoost Classifier
+
+This model is the main nonlinear classifier in the report. XGBoost is appropriate here because it can capture interactions and nonlinear default patterns more effectively than a purely linear model.
+
+```{r}
+scale_pos_weight <- sum(y_default_train == 0) / max(sum(y_default_train == 1), 1)
+
+dtrain_cls <- xgb.DMatrix(data = as.matrix(X_train_scaled), label = y_default_train)
+dval_cls   <- xgb.DMatrix(data = as.matrix(X_val_scaled), label = y_default_val)
+
+xgb_classifier <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.9,
+    colsample_bytree = 0.9,
+    scale_pos_weight = scale_pos_weight
+  ),
+  data = dtrain_cls,
+  nrounds = 300,
+  verbose = 0
+)
+
+xgb_classifier_val_proba <- predict(xgb_classifier, dval_cls)
+xgb_classifier_auc <- as.numeric(roc(y_default_val, xgb_classifier_val_proba, quiet = TRUE)$auc)
+
+cat("XGBoost Validation AUC:", round(xgb_classifier_auc, 6), "\n")
+```
+
+### Stage 1 Model Comparison
+
+This comparison table and chart make it easier to see which classification model performs best on the validation set.
+
+```{r}
+classification_results <- data.frame(
+  Model = c("Logistic Regression", "Elastic Net Logistic", "XGBoost Classifier"),
+  AUC = c(logistic_auc, elastic_net_auc, xgb_classifier_auc)
+) %>%
+  arrange(desc(AUC))
+
+kable(classification_results, caption = "Stage 1 Classification Results")
+
+ggplot(classification_results, aes(x = reorder(Model, AUC), y = AUC)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Stage 1 Default Classification Model Comparison",
+    x = "Model",
+    y = "AUC"
+  )
+```
+
+## Stage 1 Improvements
+
+This section adds a second pass of Stage 1 checks, including cross-validated logistic regression, a random forest benchmark, and a stronger comparison against XGBoost.
+
+### Why these extra checks are helpful
+
+These extra checks strengthen the report. Instead of relying on just one split and one baseline, they show that the Stage 1 conclusion is stable across multiple model families and evaluation views.
+
+### Cross-Validated Logistic Regression
+
+This chunk uses cross-validation to evaluate the logistic baseline more robustly.
+
+```{r}
+cv_control <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+cv_train_df <- data.frame(
+  Default = factor(ifelse(y_default_train == 1, "Default", "NoDefault"),
+                   levels = c("NoDefault", "Default")),
+  X_train_scaled
+)
+
+logistic_cv_model <- train(
+  Default ~ .,
+  data = cv_train_df,
+  method = "glm",
+  family = binomial(),
+  metric = "ROC",
+  trControl = cv_control
+)
+
+print(logistic_cv_model)
+```
+
+### Random Forest Benchmark
+
+Random Forest gives a second tree-based benchmark. It helps show whether the advantage of XGBoost comes specifically from boosting rather than from tree models in general.
+
+```{r}
+rf_classifier <- randomForest(
+  x = X_train_scaled,
+  y = factor(y_default_train, levels = c(0, 1), labels = c("NoDefault", "Default")),
+  ntree = 300
+)
+
+rf_val_proba <- predict(rf_classifier, X_val_scaled, type = "prob")[, "Default"]
+rf_auc <- as.numeric(roc(y_default_val, rf_val_proba, quiet = TRUE)$auc)
+
+cat("Random Forest Validation AUC:", round(rf_auc, 6), "\n")
+```
+
+### ROC Curve Comparison
+
+The ROC curves show how each classifier behaves across all classification thresholds, not just one cutoff. This is useful because the final project cares about ranking risky loans well.
+
+```{r}
+roc_log <- roc(y_default_val, logistic_val_proba, quiet = TRUE)
+roc_enet <- roc(y_default_val, elastic_net_val_proba, quiet = TRUE)
+roc_xgb <- roc(y_default_val, xgb_classifier_val_proba, quiet = TRUE)
+
+plot(roc_log, col = "steelblue", main = "ROC Curve Comparison for Stage 1 Models")
+plot(roc_enet, col = "darkorange", add = TRUE)
+plot(roc_xgb, col = "darkgreen", add = TRUE)
+legend(
+  "bottomright",
+  legend = c(
+    paste0("Logistic (AUC = ", round(as.numeric(roc_log$auc), 3), ")"),
+    paste0("Elastic Net (AUC = ", round(as.numeric(roc_enet$auc), 3), ")"),
+    paste0("XGBoost (AUC = ", round(as.numeric(roc_xgb$auc), 3), ")")
+  ),
+  col = c("steelblue", "darkorange", "darkgreen"),
+  lwd = 2
+)
+```
+
+## Stage 2: Prepare Loss-Only Data
+
+For severity modeling, I keep only the observations with positive loss. This follows the logic of a two-stage expected-loss framework, where Stage 1 handles default occurrence and Stage 2 handles loss magnitude among defaults.
+
+### Why zero-loss rows are removed here
+
+Once Stage 1 handles the default decision, Stage 2 should focus only on the size of loss among defaulted loans. Including all zero-loss rows again would blur the severity problem and make the regression target much less informative.
+
+```{r}
+default_train_mask <- y_loss_train > 0
+default_val_mask   <- y_loss_val > 0
+
+X_train_loss_only <- X_train_scaled[default_train_mask, , drop = FALSE]
+X_val_loss_only   <- X_val_scaled[default_val_mask, , drop = FALSE]
+
+y_train_loss_only <- y_loss_train[default_train_mask]
+y_val_loss_only   <- y_loss_val[default_val_mask]
+
+cat("Stage 2 training rows:", nrow(X_train_loss_only), "\n")
+cat("Stage 2 validation rows:", nrow(X_val_loss_only), "\n")
+```
+
+## Stage 2: Loss Severity Models
+
+This section compares Ridge, PLS, and XGBoost for Stage 2. The final prediction pipeline is kept consistent with the strongest Stage 2 model selected from this comparison.
+
+### What this stage is trying to learn
+
+At this point, the task is no longer “will there be a loss?” but instead “how large will the loss be if default happens?” That is why the models are evaluated with MAE rather than AUC.
+
+### Ridge Regression
+
+Ridge regression provides a linear baseline for severity prediction.
+
+```{r}
+ridge_cv <- cv.glmnet(
+  x = as.matrix(X_train_loss_only),
+  y = y_train_loss_only,
+  alpha = 0,
+  family = "gaussian",
+  nfolds = 5
+)
+
+ridge_val_pred <- as.vector(predict(ridge_cv, newx = as.matrix(X_val_loss_only), s = "lambda.min"))
+ridge_mae <- mae(y_val_loss_only, ridge_val_pred)
+
+cat("Ridge Regression MAE:", round(ridge_mae, 6), "\n")
+```
+
+### PLS Regression
+
+PLS is useful when there are many predictors and we want a lower-dimensional representation that still stays connected to the response variable.
+
+```{r}
+pls_components_stage2 <- min(10, ncol(X_train_loss_only), nrow(X_train_loss_only) - 1)
+pls_components_stage2 <- max(pls_components_stage2, 1)
+
+pls_stage2 <- plsr(
+  y_train_loss_only ~ .,
+  data = data.frame(y_train_loss_only = y_train_loss_only, X_train_loss_only),
+  ncomp = pls_components_stage2,
+  method = "oscorespls",
+  validation = "none"
+)
+
+pls_val_pred <- as.vector(predict(pls_stage2, newdata = data.frame(X_val_loss_only), ncomp = pls_components_stage2))
+pls_mae_stage2 <- mae(y_val_loss_only, pls_val_pred)
+
+cat("PLS Regression MAE:", round(pls_mae_stage2, 6), "\n")
+```
+
+### XGBoost Regressor
+
+This is the main nonlinear Stage 2 model. It is especially suitable when severity depends on feature interactions and nonlinear structure.
+
+```{r}
+dtrain_reg <- xgb.DMatrix(data = as.matrix(X_train_loss_only), label = y_train_loss_only)
+dval_reg   <- xgb.DMatrix(data = as.matrix(X_val_loss_only), label = y_val_loss_only)
+
+xgb_regressor <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    eval_metric = "mae",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.9,
+    colsample_bytree = 0.9
+  ),
+  data = dtrain_reg,
+  nrounds = 400,
+  verbose = 0
+)
+
+xgb_regressor_val_pred <- predict(xgb_regressor, dval_reg)
+xgb_regressor_mae <- mae(y_val_loss_only, xgb_regressor_val_pred)
+
+cat("XGBoost Regressor MAE:", round(xgb_regressor_mae, 6), "\n")
+```
+
+### Stage 2 Model Comparison
+
+This section summarizes the severity models and shows which one gives the lowest validation error.
+
+```{r}
+regression_results <- data.frame(
+  Model = c("Ridge Regression", "PLS Regression", "XGBoost Regressor"),
+  MAE = c(ridge_mae, pls_mae_stage2, xgb_regressor_mae)
+) %>%
+  arrange(MAE)
+
+kable(regression_results, caption = "Stage 2 Regression Results")
+
+ggplot(regression_results, aes(x = reorder(Model, MAE), y = MAE)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Stage 2 Loss Severity Model Comparison",
+    x = "Model",
+    y = "MAE"
+  )
+```
+
+### Actual vs Predicted Loss Severity
+
+This diagnostic plot helps check whether the best regression model is following the general pattern of the true loss values.
+
+```{r}
+actual_vs_predicted <- data.frame(
+  Actual_Loss = y_val_loss_only,
+  Predicted_Loss = xgb_regressor_val_pred
+)
+
+ggplot(actual_vs_predicted, aes(x = Actual_Loss, y = Predicted_Loss)) +
+  geom_point(alpha = 0.4) +
+  labs(
+    title = "Actual vs Predicted Loss Severity",
+    x = "Actual Loss",
+    y = "Predicted Loss"
+  )
+```
+
+## Train Final Models on Full Training Data and Predict Test Loss
+
+This section builds the final submission pipeline using the full training data. Since XGBoost Regressor is evaluated as the strongest Stage 2 model, it is also used in the final prediction pipeline.
+
+### Step 1: Rebuild the full encoded dataset
+
+Before making final predictions, I refit the preprocessing steps on the complete training data so the final models can learn from all available labeled observations.
+
+```{r}
+# Re-encode full training and test data using maps learned from the full training set
+full_level_maps <- fit_level_maps(X_train_raw)
+X_full_train_encoded <- apply_level_maps(X_train_raw, full_level_maps)
+X_full_test_encoded  <- apply_level_maps(X_test_raw, full_level_maps)
+
+full_safe_feature_names <- make.names(names(X_full_train_encoded), unique = TRUE)
+names(X_full_train_encoded) <- full_safe_feature_names
+names(X_full_test_encoded)  <- full_safe_feature_names
+
+# Refit preprocessing on full training data
+full_imputer <- preProcess(X_full_train_encoded, method = "medianImpute")
+X_full_train_imputed <- predict(full_imputer, X_full_train_encoded)
+X_full_test_imputed  <- predict(full_imputer, X_full_test_encoded)
+
+full_scaler <- preProcess(X_full_train_imputed, method = c("center", "scale"))
+X_full_train_scaled <- predict(full_scaler, X_full_train_imputed)
+X_full_test_scaled  <- predict(full_scaler, X_full_test_imputed)
+
+X_full_train_scaled <- clean_numeric_df(X_full_train_scaled)
+X_full_test_scaled  <- clean_numeric_df(X_full_test_scaled)
+```
+
+### Step 2: Train the final Stage 1 classifier
+
+This chunk fits the XGBoost classifier on the full training set so it can produce final default probabilities for the test set.
+
+```{r}
+
+# Final Stage 1 classifier
+full_scale_pos_weight <- sum(y_default == 0) / max(sum(y_default == 1), 1)
+
+dtrain_full_cls <- xgb.DMatrix(data = as.matrix(X_full_train_scaled), label = y_default)
+dtest_full <- xgb.DMatrix(data = as.matrix(X_full_test_scaled))
+
+final_xgb_classifier <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.9,
+    colsample_bytree = 0.9,
+    scale_pos_weight = full_scale_pos_weight
+  ),
+  data = dtrain_full_cls,
+  nrounds = 300,
+  verbose = 0
+)
+```
+
+### Step 3: Train the final Stage 2 regressor
+
+This chunk fits the final severity model using only positive-loss rows from the full training data.
+
+```{r}
+
+# Final Stage 2 regressor using only positive-loss rows
+full_default_mask <- y_loss > 0
+X_full_train_loss_only <- X_full_train_scaled[full_default_mask, , drop = FALSE]
+y_full_loss_only <- y_loss[full_default_mask]
+
+dtrain_full_reg <- xgb.DMatrix(data = as.matrix(X_full_train_loss_only), label = y_full_loss_only)
+
+final_xgb_regressor <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    eval_metric = "mae",
+    max_depth = 4,
+    eta = 0.05,
+    subsample = 0.9,
+    colsample_bytree = 0.9
+  ),
+  data = dtrain_full_reg,
+  nrounds = 400,
+  verbose = 0
+)
+```
+
+### Step 4: Generate final expected-loss predictions
+
+The final prediction is the expected loss for each test record. It is computed by multiplying the probability of default from Stage 1 by the predicted severity from Stage 2.
+
+```{r}
+
+# Test predictions
+test_default_probability <- predict(final_xgb_classifier, dtest_full)
+test_loss_prediction <- predict(final_xgb_regressor, dtest_full)
+test_loss_prediction <- pmax(test_loss_prediction, 0)
+
+final_test_prediction <- test_default_probability * test_loss_prediction
+
+submission_df <- data.frame(
+  id = test_ids,
+  loss = final_test_prediction
+)
+
+write.csv(submission_df, "submission.csv", row.names = FALSE)
+
+head(submission_df, 20)
+```
+
+## Final Test Summary
+
+This section gives a simple business-style summary of the test predictions, including how many loans would be flagged as defaults using a fixed threshold and how many defaults are expected on average from the probability outputs.
+
+```{r}
+default_threshold <- 0.5
+predicted_default_count <- sum(test_default_probability >= default_threshold)
+predicted_default_pct <- predicted_default_count / length(test_default_probability) * 100
+expected_default_count <- sum(test_default_probability)
+expected_default_pct <- mean(test_default_probability) * 100
+total_test_obs <- length(test_default_probability)
+
+test_default_summary <- data.frame(
+  Metric = c(
+    "Total Test Observations",
+    "Predicted Defaults (threshold=0.5)",
+    "Predicted Default Percentage",
+    "Expected Defaults (sum of probabilities)",
+    "Expected Default Percentage"
+  ),
+  Value = c(
+    total_test_obs,
+    predicted_default_count,
+    paste0(round(predicted_default_pct, 2), "%"),
+    round(expected_default_count, 2),
+    paste0(round(expected_default_pct, 2), "%")
+  )
+)
+
+kable(test_default_summary, caption = "Final Test Default Summary")
+```
+
+```{r}
+ggplot(data.frame(probability = test_default_probability), aes(x = probability)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = default_threshold, color = "red", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribution of Predicted Default Probabilities",
+    x = "Predicted Probability of Default",
+    y = "Count"
+  )
+```
+
+```{r}
+predicted_default_distribution <- data.frame(
+  Category = c("Predicted Non-Default", "Predicted Default"),
+  Count = c(total_test_obs - predicted_default_count, predicted_default_count)
+)
+
+ggplot(predicted_default_distribution, aes(x = Category, y = Count, fill = Category)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "Predicted Default Distribution in Test Set",
+    x = "",
+    y = "Number of Observations"
+  )
+```
+
+## Final Summary
+
+This final chunk prints the most important project metrics in one place so the results are easy to review.
+
+```{r}
+cat("\n========== FINAL MODEL SUMMARY ==========\n")
+cat("Dataset Size:", nrow(X_full_train_encoded), "training rows\n")
+cat("Encoded Features:", ncol(X_full_train_encoded), "\n")
+cat("Default Rate:", round(mean(y_default) * 100, 2), "%\n")
+cat("Best Stage 1 Model Used for Final Submission: XGBoost\n")
+cat("Validation AUC:", round(xgb_classifier_auc, 4), "\n")
+cat("Best Stage 2 Model Used for Final Submission: XGBoost Regressor\n")
+cat("Validation MAE:", round(xgb_regressor_mae, 4), "\n")
+
+```
+
+## Conclusion
+
+This R Markdown begins with data inspection, builds a two-stage modeling framework, compares multiple models at each stage, and finishes by generating a submission file in the required `id, loss` format.
+
+The final pipeline predicts expected loss as:
+
+$$
+\text{Expected Loss} = P(\text{Default}) \times \text{Predicted Loss Severity}
+$$
