@@ -29,8 +29,12 @@ options(scipen = 999)
 ## Loading Data
 
 ```{r}
-train_path <- normalizePath("~/Desktop/Group Project ADM&PA/train_v3.csv")
-test_path  <- normalizePath("~/Desktop/Group Project ADM&PA/test__no_lossv3.csv")
+train_path <- "data/train_v3.csv"
+test_path  <- "data/test__no_lossv3.csv"
+
+if (!file.exists(train_path) || !file.exists(test_path)) {
+  stop("Raw data files are not included in this repository. Place train_v3.csv and test__no_lossv3.csv in the data/ folder before running the notebook.")
+}
 
 train_df <- fread(train_path)
 test_df  <- fread(test_path)

@@ -378,8 +378,8 @@ options(scipen = 999)</code></pre>
 </div>
 <div id="loading-data" class="section level2">
 <h2>Loading Data</h2>
-<pre class="r"><code>train_path &lt;- normalizePath(&quot;~/Desktop/Group Project ADM&amp;PA/train_v3.csv&quot;)
-test_path  &lt;- normalizePath(&quot;~/Desktop/Group Project ADM&amp;PA/test__no_lossv3.csv&quot;)
+<pre class="r"><code>train_path &lt;- &quot;data/train_v3.csv&quot;
+test_path  &lt;- &quot;data/test__no_lossv3.csv&quot;
 
 train_df &lt;- fread(train_path)
 test_df  &lt;- fread(test_path)
